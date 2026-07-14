@@ -59,3 +59,47 @@ android/app/*.keystore
 
 # OpenHarmony dependencies
 ohos_deps/
+
+# ---------- HarmonyOS / OpenHarmony (Flutter OH) ----------
+# ohpm 依赖 (相当于 node_modules，不应提交)
+ohos/oh_modules/
+ohos/**/oh_modules/
+# hvigor 构建缓存
+ohos/.hvigor/
+ohos/.hvigorw/
+ohos/**/.hvigor/
+ohos/**/.hvigorw/
+# C/C++ 中间产物
+ohos/**/.cxx/
+# 构建输出目录（HAP/HSP/APP 会在这里生成，文件体积大）
+ohos/build/
+ohos/**/build/
+# 应用分析器的临时输出 (非源码)
+ohos/.appanalyzer/
+# 签名材料（私钥 / Profile / 证书绝对不能提交到公开仓库！）
+ohos/signing/
+*.p12
+*.pfx
+*.keystore
+*.jks
+*.p7b
+*.p7s
+*.cer
+*.crt
+*.pem
+# HarmonyOS 产物
+*.hap
+*.hsp
+*.app
+# 我们的 CI patch 脚本运行时产物
+_hap-artifacts/
+ohos/signing/_patch.mjs
+# Flutter OpenHarmony 生成的锁定文件 (平台特定，不应共享)
+ohos/.flutter-plugins-ohos
+ohos/flutter_export_environment.sh
+ohos/local.properties
+local.properties
+# DevEco Studio 用户级配置
+.deveco/
+*.hvc
+devecostudio/

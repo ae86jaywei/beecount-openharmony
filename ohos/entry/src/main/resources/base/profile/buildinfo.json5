@@ -2,7 +2,8 @@
   "string": [
     {
       "name": "enable_impeller",
-      "value": "true"
+      "value": "true",
+      "translatable": false
     }
   ]
 }

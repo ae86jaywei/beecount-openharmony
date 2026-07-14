@@ -1,0 +1,558 @@
+# =============================================================
+#  GitHub Actions Workflow: 用已构建的 Docker 镜像编译蜜蜂记账 HAP
+#  镜像来源：ghcr.io/ae86jaywei/beecount-openharmony-builder:*
+#
+#  签名策略（永久固化，无需手勾开关）：
+#   ・Debug  构建 → 每次运行时现场生成一套临时签名 (keytool + openssl + hvigor encrypt)
+#   ・Release 构建 → 当仓库 Secrets 中以下 5 项全部齐全时，自动启用正式签名：
+#       SIGNING_RELEASE_P12           base64(release.p12)
+#       SIGNING_RELEASE_PROFILE       base64(release.p7b)
+#       SIGNING_RELEASE_STORE_PWD_ENC  hvigor 加密后的密文 (storePassword)
+#       SIGNING_RELEASE_KEY_PWD_ENC    hvigor 加密后的密文 (keyPassword)
+#       SIGNING_RELEASE_KEY_ALIAS      明文 alias (e.g. releaseKey)
+#    ⚠️ 缺任何一项 → Release 降级为 unsigned (continue-on-error, 不阻塞)
+# =============================================================
+
+name: Build BeeCount (OpenHarmony / HAP)
+
+run-name: >
+  Build HAP ${{ github.ref_name }}
+  ${{ inputs.build_type }}
+  ${{ inputs.dry_run && '(dry-run)' || '' }}
+
+# ---------- 触发条件 ----------
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型'
+        type: choice
+        default: 'both'
+        options:
+          - both
+          - debug
+          - release
+        required: true
+      dry_run:
+        description: 'Dry run (只做环境自检 + pub get，不 build hap)'
+        type: boolean
+        default: false
+        required: false
+      extra_flutter_args:
+        description: '额外传给 flutter build hap 的参数 (例如 --dart-define=XXX=YYY)'
+        type: string
+        default: ''
+        required: false
+      docker_image:
+        description: '自定义 Docker 镜像 tag'
+        type: string
+        default: 'ghcr.io/ae86jaywei/beecount-openharmony-builder:sha-3018845'
+        required: false
+
+# ---------- Job 级全局环境变量 ----------
+env:
+  DEFAULT_DOCKER_IMAGE: ghcr.io/ae86jaywei/beecount-openharmony-builder:sha-3018845
+  PUB_HOSTED_URL: https://pub.flutter-io.cn
+  FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+  PUB_CACHE: /root/.pub-cache
+  GRADLE_USER_HOME: /root/.gradle
+  OHOS_SDK_HOME: /opt/devecostudio/sdk
+
+# =============================================================
+#  Job: Build HAP
+# =============================================================
+jobs:
+  build-hap:
+    name: Build HAP (Debug + Release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    container:
+      image: ${{ github.event.inputs.docker_image || env.DEFAULT_DOCKER_IMAGE }}
+      credentials:
+        username: ${{ secrets.GHCR_USERNAME || github.actor }}
+        password: ${{ secrets.GHCR_TOKEN   || secrets.GITHUB_TOKEN }}
+      options: >-
+        --user root
+        --env PUB_CACHE=/root/.pub-cache
+        --env GRADLE_USER_HOME=/root/.gradle
+        --env OHOS_SDK_HOME=/opt/devecostudio/sdk
+      env:
+        PUB_CACHE: /root/.pub-cache
+        GRADLE_USER_HOME: /root/.gradle
+
+    steps:
+      # ======================================================
+      #  Step 0. 容器环境预处理
+      # ======================================================
+      - name: 🔧 容器环境预处理
+        id: bootstrap
+        run: |
+          set -euo pipefail
+          export PROJECT_ROOT="${GITHUB_WORKSPACE}"
+          echo "PROJECT_ROOT=${PROJECT_ROOT}" >> "$GITHUB_ENV"
+
+          echo "::group::(1) Git safe.directory"
+          git config --global --add safe.directory '*' || true
+          git config --global --add safe.directory /opt/flutter || true
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          echo "pwd=$(pwd)"
+          echo "::endgroup::"
+
+          echo "::group::(2) 创建缓存目录"
+          mkdir -p "${PUB_CACHE}" "${GRADLE_USER_HOME}"
+          chmod -R a+rwx "${PUB_CACHE}" "${GRADLE_USER_HOME}"
+          echo "::endgroup::"
+
+          echo "::group::(3) 工具链版本自检"
+          (flutter --version) || true
+          (dart --version)    || true
+          (java -version 2>&1) || true
+          (node --version)    || true
+          (npm --version)     || true
+          (keytool -help 2>&1 | head -n 1) || echo "keytool: not found"
+          (openssl version)   || echo "openssl: not found"
+          (ohpm --version 2>&1 | head -n 3) || command -v ohpm || echo "ohpm: not found"
+          (hvigor --version 2>&1 | head -n 3) || (command -v hvigorw && echo "hvigorw: exists") || echo "hvigor[w]: not found"
+          echo "::endgroup::"
+
+          echo "::group::(4) 绑定 Flutter -> OHOS SDK"
+          if [ -d "${OHOS_SDK_HOME}/default/openharmony/12" ] || [ -d "${OHOS_SDK_HOME}/default/openharmony" ]; then
+            flutter config --ohos-sdk "${OHOS_SDK_HOME}" || true
+          else
+            echo "⚠️  OHOS SDK 目录缺失，flutter build hap 大概率失败"
+          fi
+          flutter config --no-analytics || true
+          flutter config --list || true
+          echo "::endgroup::"
+
+          echo "::group::(5) flutter doctor (非阻塞)"
+          flutter doctor -v || true
+          echo "::endgroup::"
+        shell: bash
+
+      # ======================================================
+      #  Step 1. Checkout 代码
+      # ======================================================
+      - name: 📥 Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      # ======================================================
+      #  Step 2. 缓存
+      # ======================================================
+      - name: 💾 Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /root/.pub-cache
+            .dart_tool
+            ohos/oh_modules
+            ohos/.hvigor
+            ohos/entry/.hvigor
+          key: ${{ runner.os }}-pub-ohos-${{ github.event.inputs.docker_image || env.DEFAULT_DOCKER_IMAGE }}-${{ hashFiles('pubspec.yaml', 'pubspec.lock', 'ohos/oh-package.json5', 'ohos/entry/oh-package.json5') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-ohos-${{ github.event.inputs.docker_image || env.DEFAULT_DOCKER_IMAGE }}-
+            ${{ runner.os }}-pub-ohos-
+
+      # ======================================================
+      #  Step 3. 准备签名材料（Debug 临时 + Release 固定）
+      #   - Debug：现场用 keytool 生成，保证 100% 可用
+      #   - Release：当 5 个 Secrets 全部存在才解锁正式签名
+      # ======================================================
+      - name: 🔐 准备两套签名材料 & 写入 patch 工具
+        id: signing
+        run: |
+          set -euo pipefail
+          SIGN_DIR="${PROJECT_ROOT}/ohos/signing"
+          mkdir -p "${SIGN_DIR}"
+          echo "SIGN_DIR=${SIGN_DIR}" >> "$GITHUB_ENV"
+
+          # ---------------------------------------------------------------
+          # (A) 生成 CI 专用的 Debug 临时签名 —— 永远可用，解决原 build-profile.json5
+          #     硬编码 /Users/matrix/.ohos/... 在 CI 里不存在的问题 (经验 963861)
+          # ---------------------------------------------------------------
+          echo "::group::(A) 现场生成 CI Debug 临时签名 (p12 + cer + p7b 占位)"
+          DEBUG_PWD="BeecountCI_Debug_$(date +%Y%m%d)_!"
+          DEBUG_ALIAS="ciDebugKey"
+          DEBUG_DNAME="CN=BeeCountCI, OU=BeeCount, O=BeeCount, L=SH, ST=SH, C=CN"
+
+          # ① p12 (包含私钥 + 公钥证书链)
+          keytool -genkeypair -v \
+            -alias "${DEBUG_ALIAS}" \
+            -keyalg EC -keysize 256 -sigalg SHA256withECDSA \
+            -dname "${DEBUG_DNAME}" \
+            -storetype PKCS12 \
+            -validity 3650 \
+            -keypass  "${DEBUG_PWD}" \
+            -storepass "${DEBUG_PWD}" \
+            -keystore "${SIGN_DIR}/ci_debug.p12" \
+            >/dev/null 2>&1
+
+          # ② cer (公钥证书单独导一份，certpath 字段要用)
+          keytool -exportcert -rfc \
+            -alias "${DEBUG_ALIAS}" \
+            -storepass "${DEBUG_PWD}" \
+            -keystore "${SIGN_DIR}/ci_debug.p12" \
+            -file "${SIGN_DIR}/ci_debug.cer" \
+            >/dev/null 2>&1
+
+          # ③ p7b (Profile)：Debug 版用公钥证书自签一个占位 p7b；部分 hvigor 版本接受 CA 链
+          openssl pkcs7 -in "${SIGN_DIR}/ci_debug.cer" -inform PEM -outform DER -out "${SIGN_DIR}/ci_debug.p7b" -nocerts -certfile "${SIGN_DIR}/ci_debug.cer" 2>/dev/null \
+            || cp -f "${SIGN_DIR}/ci_debug.cer" "${SIGN_DIR}/ci_debug.p7b"
+
+          # ④ 密码密文 (hvigor 格式：build-profile.json5 禁止明文)
+          HVIGOR_BIN="$(command -v hvigor || true)"
+          if [ -z "${HVIGOR_BIN}" ] && [ -x /opt/devecostudio/tools/hvigor/bin/hvigor ]; then HVIGOR_BIN=/opt/devecostudio/tools/hvigor/bin/hvigor; fi
+          if [ -z "${HVIGOR_BIN}" ]; then
+            # 回退：ohos 目录里若有 hvigorw，就用它
+            if [ -x "${PROJECT_ROOT}/ohos/hvigorw" ]; then HVIGOR_BIN="${PROJECT_ROOT}/ohos/hvigorw"; fi
+          fi
+          DEBUG_STORE_ENC="$( ${HVIGOR_BIN} encrypt -p "password=${DEBUG_PWD}" 2>/dev/null | tail -n 1 | tr -d '\r' )"
+          DEBUG_KEY_ENC="${DEBUG_STORE_ENC}"
+          echo "✅ CI Debug 签名就绪"
+          ls -lah "${SIGN_DIR}/"ci_debug.*
+          echo "::endgroup::"
+
+          # ---------------------------------------------------------------
+          # (B) 当 5 个 Release Secret 全部存在 → 写入 Release 签名
+          # ---------------------------------------------------------------
+          RELEASE_OK=true
+          [ -z "${{ secrets.SIGNING_RELEASE_P12 }}" ]           && RELEASE_OK=false
+          [ -z "${{ secrets.SIGNING_RELEASE_PROFILE }}" ]       && RELEASE_OK=false
+          [ -z "${{ secrets.SIGNING_RELEASE_STORE_PWD_ENC }}" ] && RELEASE_OK=false
+          [ -z "${{ secrets.SIGNING_RELEASE_KEY_PWD_ENC }}" ]   && RELEASE_OK=false
+          [ -z "${{ secrets.SIGNING_RELEASE_KEY_ALIAS }}" ]     && RELEASE_OK=false
+
+          if [ "${RELEASE_OK}" = "true" ]; then
+            echo "::group::(B) 写入 Release 正式签名 (5 项 Secrets 齐全)"
+            echo "${{ secrets.SIGNING_RELEASE_P12 }}"     | base64 -d > "${SIGN_DIR}/release.p12"
+            echo "${{ secrets.SIGNING_RELEASE_PROFILE }}" | base64 -d > "${SIGN_DIR}/release.p7b"
+
+            # certpath：从 p12 导出 cer（用户一般不会单独提供 cer，导出即可）
+            # 注意：release 的密码明文我们拿不到（只拿到了加密后的密文），
+            #       所以这里不校验 p12，只在导出 cer 失败时给提示；
+            #       如果 build 阶段报 "invalid keystore password"，请重新检查 SIGNING_RELEASE_STORE_PWD_ENC
+            keytool -exportcert -rfc \
+              -alias "${{ secrets.SIGNING_RELEASE_KEY_ALIAS }}" \
+              -keystore "${SIGN_DIR}/release.p12" \
+              -storepass:file <(true) \
+              -file "${SIGN_DIR}/release.cer" 2>/dev/null \
+              || echo "⚠️  无法从 release.p12 导出 cer (通常因无法读取明文密码，不影响，若后续 SignHap 报 cer 缺失可手动提供 base64 的 cer 新增 Secret SIGNING_RELEASE_CER)"
+
+            # 手动提供 cer 的 fallback
+            if [ -n "${{ secrets.SIGNING_RELEASE_CER:-}}" ] && [ ! -s "${SIGN_DIR}/release.cer" ]; then
+              echo "${{ secrets.SIGNING_RELEASE_CER }}" | base64 -d > "${SIGN_DIR}/release.cer"
+            fi
+            # 若 release.cer 还不存在，就复用 debug 的 (占位，避免路径空值)
+            if [ ! -s "${SIGN_DIR}/release.cer" ]; then
+              cp -f "${SIGN_DIR}/ci_debug.cer" "${SIGN_DIR}/release.cer"
+            fi
+
+            RELEASE_ALIAS="${{ secrets.SIGNING_RELEASE_KEY_ALIAS }}"
+            RELEASE_STORE_ENC="${{ secrets.SIGNING_RELEASE_STORE_PWD_ENC }}"
+            RELEASE_KEY_ENC="${{ secrets.SIGNING_RELEASE_KEY_PWD_ENC }}"
+            ls -lah "${SIGN_DIR}/"release.* 2>/dev/null || true
+            echo "✅ Release 签名已就绪 (alias=${RELEASE_ALIAS})"
+            echo "::endgroup::"
+          else
+            echo "::group::(B) 跳过 Release 正式签名 (Secrets 未齐全 —— Release 产物将为 unsigned)"
+            RELEASE_ALIAS="" ; RELEASE_STORE_ENC="" ; RELEASE_KEY_ENC=""
+            echo "   需要 SIGNING_RELEASE_P12 / SIGNING_RELEASE_PROFILE / SIGNING_RELEASE_STORE_PWD_ENC / SIGNING_RELEASE_KEY_PWD_ENC / SIGNING_RELEASE_KEY_ALIAS"
+            echo "::endgroup::"
+          fi
+
+          # ---------------------------------------------------------------
+          # (C) 写 Node patch 脚本到 ohos/signing/_patch.mjs
+          #     用法：node _patch.mjs --mode debug|release
+          #     功能：覆盖 app.signingConfigs[0].material 为传入模式的真实路径
+          # ---------------------------------------------------------------
+          cat > "${SIGN_DIR}/_patch.mjs" <<'NODE_EOF'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import { resolve, dirname } from 'node:path';
+          import { fileURLToPath } from 'node:url';
+
+          const args = process.argv.slice(2);
+          const modeIdx = args.indexOf('--mode');
+          const MODE = (modeIdx >= 0 ? args[modeIdx + 1] : 'debug');
+          if (!['debug', 'release'].includes(MODE)) {
+            console.error('usage: node _patch.mjs --mode debug|release');
+            process.exit(1);
+          }
+
+          const __dirname = dirname(fileURLToPath(import.meta.url));
+          const projectRoot = resolve(__dirname, '..', '..');
+          const bpPath = resolve(projectRoot, 'ohos', 'build-profile.json5');
+          let src = readFileSync(bpPath, 'utf8');
+
+          // JSON5 不标准 (末尾逗号、单引号)，用正则做最小侵入 patch，避免解析失败
+          // 1) 生成要注入的 material 片段
+          const env = process.env;
+          const SIGN_DIR = env.SIGN_DIR || resolve(__dirname);
+          let material;
+          if (MODE === 'debug') {
+            material = {
+              certpath:     `${SIGN_DIR}/ci_debug.cer`,
+              keyAlias:     env.DEBUG_ALIAS || 'ciDebugKey',
+              keyPassword:  env.DEBUG_STORE_ENC || 'ERROR_ENC_MISSING',
+              profile:      `${SIGN_DIR}/ci_debug.p7b`,
+              signAlg:      'SHA256withECDSA',
+              storeFile:    `${SIGN_DIR}/ci_debug.p12`,
+              storePassword: env.DEBUG_STORE_ENC || 'ERROR_ENC_MISSING',
+            };
+          } else {
+            material = {
+              certpath:     `${SIGN_DIR}/release.cer`,
+              keyAlias:     env.RELEASE_ALIAS,
+              keyPassword:  env.RELEASE_KEY_ENC,
+              profile:      `${SIGN_DIR}/release.p7b`,
+              signAlg:      'SHA256withECDSA',
+              storeFile:    `${SIGN_DIR}/release.p12`,
+              storePassword: env.RELEASE_STORE_ENC,
+            };
+          }
+
+          // 2) 把 app.signingConfigs[0].material 的 6 个字段用新值原地替换
+          //    策略：直接把原 material 对象替换成新 JSON（JSON5 允许，且外层结构完全不变）
+          const newMaterial = JSON.stringify(material, null, 10)
+            .replace(/"([^"]+)":/g, '$1:')              // 去掉 key 上的引号（JSON5 语法允许，保持与原文件风格一致）
+            .replace(/\n\s+\}/, '\n        }');         // 末尾括号缩进对齐（与原文件 indent 对齐）
+          src = src.replace(/("material"|material)\s*:\s*\{[\s\S]*?\n\s{8}\}/, newMaterial.replace(/^/, '        material: '));
+
+          // 3) 兼容：若 products.default.signingConfig 不是 "default"，强制改回 default (避免某些项目多 profile)
+          src = src.replace(/"signingConfig"\s*:\s*"[^"]+"/g, '"signingConfig": "default"')
+                   .replace(/signingConfig\s*:\s*'[^']+'/g,   "signingConfig: 'default'");
+
+          writeFileSync(bpPath, src);
+          console.log(`[patch] ${MODE} signing material written → ${bpPath}`);
+          console.log(`[patch] storeFile = ${material.storeFile}`);
+          console.log(`[patch] certpath  = ${material.certpath}`);
+          console.log(`[patch] profile   = ${material.profile}`);
+          console.log(`[patch] keyAlias  = ${material.keyAlias}`);
+          NODE_EOF
+
+          # ---------------------------------------------------------------
+          # (D) 导出 GITHUB_ENV：后续 Step 可以直接用这些值传给 Node
+          # ---------------------------------------------------------------
+          {
+            echo "DEBUG_ALIAS=${DEBUG_ALIAS}"
+            echo "DEBUG_STORE_ENC=${DEBUG_STORE_ENC}"
+            echo "DEBUG_KEY_ENC=${DEBUG_KEY_ENC}"
+            echo "RELEASE_OK=${RELEASE_OK}"
+            echo "RELEASE_ALIAS=${RELEASE_ALIAS}"
+            echo "RELEASE_STORE_ENC=${RELEASE_STORE_ENC}"
+            echo "RELEASE_KEY_ENC=${RELEASE_KEY_ENC}"
+          } >> "$GITHUB_ENV"
+
+          echo "release_enabled=${RELEASE_OK}"   >> "$GITHUB_OUTPUT"
+          echo "signing_dir=${SIGN_DIR}"         >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # ======================================================
+      #  Step 4. flutter pub get
+      # ======================================================
+      - name: 🪶 flutter pub get
+        id: pub_get
+        run: |
+          set -euo pipefail
+          cd "${PROJECT_ROOT}"
+          head -n 20 pubspec.yaml >/dev/null
+          flutter pub get
+        shell: bash
+
+      # ======================================================
+      #  Step 5. build_runner (drift/l10n 代码生成)
+      # ======================================================
+      - name: 🧪 build_runner
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          set -euo pipefail
+          cd "${PROJECT_ROOT}"
+          dart run build_runner build --delete-conflicting-outputs
+        shell: bash
+
+      # ======================================================
+      #  Step 6. Build HAP — DEBUG（先 patch 成 CI Debug 签名再构建）
+      # ======================================================
+      - name: 🩹 [DEBUG] 注入 CI Debug 签名到 build-profile.json5
+        if: >-
+          inputs.dry_run != true
+          && (inputs.build_type == 'debug' || inputs.build_type == 'both')
+        run: |
+          set -euo pipefail
+          cd "${PROJECT_ROOT}"
+          export DEBUG_ALIAS="${DEBUG_ALIAS}" DEBUG_STORE_ENC="${DEBUG_STORE_ENC}" DEBUG_KEY_ENC="${DEBUG_KEY_ENC}"
+          node ohos/signing/_patch.mjs --mode debug
+          echo "::group::验证 build-profile.json5 内容片段（只显示签名 material 字段）"
+          sed -n '/signingConfigs/,/products/p' ohos/build-profile.json5 | head -n 30
+          echo "::endgroup::"
+        shell: bash
+
+      - name: 🔨 Build HAP — DEBUG
+        id: build_debug
+        if: >-
+          inputs.dry_run != true
+          && (inputs.build_type == 'debug' || inputs.build_type == 'both')
+        run: |
+          set -euo pipefail
+          cd "${PROJECT_ROOT}"
+          if command -v ohpm >/dev/null 2>&1 && [ -f "ohos/oh-package.json5" ]; then
+            echo "::group::ohpm install (冗余)"
+            (cd ohos && ohpm install || true)
+            echo "::endgroup::"
+          fi
+
+          echo "::group::flutter build hap --debug"
+          # shellcheck disable=SC2086
+          flutter build hap --debug --no-version-check ${{ inputs.extra_flutter_args }}
+          echo "::endgroup::"
+
+          echo "::group::所有产物"
+          find ohos -type f \( -name "*.hap" -o -name "*.app" \) 2>/dev/null | sort
+          echo "::endgroup::"
+        shell: bash
+
+      # ======================================================
+      #  Step 7. Build HAP — RELEASE
+      # ======================================================
+      - name: 🩹 [RELEASE] 注入 Release 签名到 build-profile.json5（已配置 5 项 Secret 时）
+        if: >-
+          inputs.dry_run != true
+          && (inputs.build_type == 'release' || inputs.build_type == 'both')
+          && env.RELEASE_OK == 'true'
+        run: |
+          set -euo pipefail
+          cd "${PROJECT_ROOT}"
+          export RELEASE_ALIAS="${RELEASE_ALIAS}" RELEASE_STORE_ENC="${RELEASE_STORE_ENC}" RELEASE_KEY_ENC="${RELEASE_KEY_ENC}"
+          node ohos/signing/_patch.mjs --mode release
+          echo "::group::验证 build-profile.json5 内容片段"
+          sed -n '/signingConfigs/,/products/p' ohos/build-profile.json5 | head -n 30
+          echo "::endgroup::"
+        shell: bash
+
+      - name: 🔥 Build HAP — RELEASE
+        id: build_release
+        if: >-
+          inputs.dry_run != true
+          && (inputs.build_type == 'release' || inputs.build_type == 'both')
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd "${PROJECT_ROOT}"
+
+          if [ "${RELEASE_OK}" != "true" ]; then
+            echo "⚠️  未配置 Release 签名 → 降级为 unsigned Release。请在仓库 Secrets 中添加 5 项 Release 签名材料。"
+          fi
+
+          echo "::group::flutter build hap --release"
+          # shellcheck disable=SC2086
+          flutter build hap --release --no-version-check ${{ inputs.extra_flutter_args }}
+          echo "::endgroup::"
+
+          echo "::group::所有产物"
+          find ohos -type f \( -name "*.hap" -o -name "*.app" \) 2>/dev/null | sort
+          echo "::endgroup::"
+        shell: bash
+
+      # ======================================================
+      #  Step 8. 上传 Artifacts
+      # ======================================================
+      - name: 📦 打包 & 上传 Artifacts
+        id: publish
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          set -euo pipefail
+          OUT="${PROJECT_ROOT}/_hap-artifacts"
+          mkdir -p "${OUT}/debug" "${OUT}/release"
+
+          echo "::group::Debug 产物复制"
+          find "${PROJECT_ROOT}/ohos" -type f \( -iname "*debug*.hap" -o -path "*debug*outputs*" -name "*.hap" \) 2>/dev/null | while read -r f; do cp -f "$f" "${OUT}/debug/"; done
+          find "${PROJECT_ROOT}/ohos" -type f -name "entry-default-signed.hap" 2>/dev/null | head -n 1 | while read -r f; do cp -f "$f" "${OUT}/debug/entry-default-signed.hap"; done
+          find "${PROJECT_ROOT}/ohos" -type f -iname "*debug*.app" 2>/dev/null | while read -r f; do cp -f "$f" "${OUT}/debug/"; done
+          ls -lah "${OUT}/debug/" || true
+          echo "::endgroup::"
+
+          echo "::group::Release 产物复制"
+          find "${PROJECT_ROOT}/ohos" -type f \( -iname "*release*.hap" -o -path "*release*outputs*" -name "*.hap" \) 2>/dev/null | while read -r f; do cp -f "$f" "${OUT}/release/"; done
+          find "${PROJECT_ROOT}/ohos" -type f -name "entry-default-unsigned.hap" 2>/dev/null | while read -r f; do cp -f "$f" "${OUT}/release/"; done
+          find "${PROJECT_ROOT}/ohos" -type f -iname "*.app" 2>/dev/null | while read -r f; do cp -f "$f" "${OUT}/release/"; done
+          ls -lah "${OUT}/release/" || true
+          echo "::endgroup::"
+
+          SHA_SHORT="${GITHUB_SHA:0:8}"
+          REF_NAME_CLEAN="$(echo "${GITHUB_REF_NAME}" | tr '/\\ ' '_' | cut -c 1-60)"
+          ART_DEBUG="beecount-hap-debug-${REF_NAME_CLEAN}-${SHA_SHORT}"
+          ART_RELEASE="beecount-hap-release-${REF_NAME_CLEAN}-${SHA_SHORT}"
+
+          echo "ART_DEBUG=${ART_DEBUG}"     >> "$GITHUB_OUTPUT"
+          echo "ART_RELEASE=${ART_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "debug_dir=${OUT}/debug"     >> "$GITHUB_OUTPUT"
+          echo "release_dir=${OUT}/release" >> "$GITHUB_OUTPUT"
+          find "${OUT}" -maxdepth 3 -type f | sort
+        shell: bash
+
+      - name: ⤴️ 上传 Debug Artifact
+        if: ${{ inputs.dry_run != true && (inputs.build_type == 'debug' || inputs.build_type == 'both') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.publish.outputs.ART_DEBUG }}
+          path: ${{ steps.publish.outputs.debug_dir }}
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: ⤴️ 上传 Release Artifact
+        if: >-
+          inputs.dry_run != true
+          && (inputs.build_type == 'release' || inputs.build_type == 'both')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.publish.outputs.ART_RELEASE }}
+          path: ${{ steps.publish.outputs.release_dir }}
+          retention-days: 90
+          if-no-files-found: warn
+
+      # ======================================================
+      #  Step 9. Summary
+      # ======================================================
+      - name: 📋 写入运行摘要
+        if: always()
+        run: |
+          {
+            echo "## 蜜蜂记账 HarmonyOS HAP 构建结果 🐝"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| Docker 镜像 | \`${{ github.event.inputs.docker_image || env.DEFAULT_DOCKER_IMAGE }}\` |"
+            echo "| 构建类型 | \`${{ inputs.build_type || 'both' }}\` |"
+            echo "| Dry Run | \`${{ inputs.dry_run }}\` |"
+            echo "| Release 正式签名 | ${{ env.RELEASE_OK == 'true' && '✅ 已启用 (5 项 Secrets 齐全)' || '⚠️  未启用 (产物 unsigned；配齐 5 项 Secret 即可自动开启)' }} |"
+            echo "| Pub Get | ${{ steps.pub_get.outcome }} |"
+            echo "| Debug Build | ${{ steps.build_debug.outcome }} |"
+            echo "| Release Build | ${{ steps.build_release.outcome }} (失败不阻塞) |"
+            echo "| Debug Artifact | \`${{ steps.publish.outputs.ART_DEBUG || '(未生成)' }}\` |"
+            echo "| Release Artifact | \`${{ steps.publish.outputs.ART_RELEASE || '(未生成)' }}\` |"
+            echo ""
+            echo "### 🔐 如何启用 Release 固定签名（一次性配置，以后所有 Push/Tag 自动签名）"
+            echo "1. 在仓库 **Settings → Secrets and variables → Actions → New repository secret** 添加 5 项："
+            echo "   | Secret 名 | 内容 |"
+            echo "   |---|---|"
+            echo "   | \`SIGNING_RELEASE_P12\` | base64 编码后的 \`release.p12\` (\`base64 -w0 release.p12\`) |"
+            echo "   | \`SIGNING_RELEASE_PROFILE\` | base64 编码后的 \`release.p7b\` (AppGallery Connect 下载) |"
+            echo "   | \`SIGNING_RELEASE_STORE_PWD_ENC\` | 用 hvigor 加密后的**密文**：\`hvigor encrypt -p password=明文密码\` 输出 |"
+            echo "   | \`SIGNING_RELEASE_KEY_PWD_ENC\` | 同上 (一般 key 密码 = store 密码) |"
+            echo "   | \`SIGNING_RELEASE_KEY_ALIAS\` | 明文 Key Alias (创建 p12 时填的) |"
+            echo "   可选（当从 p12 导 cer 失败时补加）：\`SIGNING_RELEASE_CER\` = base64(release.cer)"
+            echo "2. 配完 5 项后：**Debug 仍使用 CI 现场生成的临时签名；Release 会自动切换为正式签名**（无需任何手动开关）。"
+            echo ""
+            echo "### 📂 下载产物"
+            echo "Run Summary → 底部 Artifacts → \`${{ steps.publish.outputs.ART_DEBUG || 'beecount-hap-debug-*' }}\` / \`${{ steps.publish.outputs.ART_RELEASE || 'beecount-hap-release-*' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
